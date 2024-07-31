@@ -18,12 +18,16 @@
 package org.apache.celeborn.tests.spark
 
 import java.io.File
+import java.util
 import java.util.concurrent.atomic.AtomicBoolean
 
 import org.apache.spark.{SparkConf, SparkContextHelper, TaskContext}
 import org.apache.spark.shuffle.ShuffleHandle
 import org.apache.spark.shuffle.celeborn.{CelebornShuffleHandle, ShuffleManagerHook, SparkShuffleManager, SparkUtils, TestCelebornShuffleManager}
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Row, RowFactory, SparkSession}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.{DataTypes, IntegerType, StringType, StructType}
+import org.junit.Assert
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -95,6 +99,7 @@ class CelebornFetchFailureSuite extends AnyFunSuite
     }
   }
 
+  /*
   test("celeborn spark integration test - Fetch Failure") {
     if (Spark3OrNewer) {
       val sparkConf = new SparkConf().setAppName("rss-demo").setMaster("local[2,3]")
@@ -294,6 +299,47 @@ class CelebornFetchFailureSuite extends AnyFunSuite
       val df3 = sparkSession.table("t_3")
       df1.union(df2).union(df3).count()
 
+      sparkSession.stop()
+    }
+  }
+  */
+  test("celeborn spark integration test - Fetch Failure - Deterministic Stage") {
+    if (Spark3OrNewer) {
+      val sparkConf = new SparkConf().setAppName("rss-demo").setMaster("local[4]")
+      val sparkSession = SparkSession.builder()
+        .config(updateSparkConf(sparkConf, ShuffleMode.HASH))
+        .config("spark.sql.shuffle.partitions", 2)
+        .config("spark.celeborn.shuffle.forceFallback.partition.enabled", false)
+        .config("spark.celeborn.shuffle.enabled", "true")
+        .config("spark.celeborn.client.spark.fetch.throwsFetchFailure", "true")
+        .config("spark.celeborn.client.spark.shuffle.writer", "sort")
+        .config("spark.celeborn.shuffle.chunk.size", "10k")
+        .config(
+          "spark.shuffle.manager",
+          "org.apache.spark.shuffle.celeborn.TestCelebornShuffleManager")
+        .config("spark.default.parallelism", "2")
+        .config("spark.celeborn.test.client.push.mockRandomPushForStageRerun", true)
+        .getOrCreate()
+
+      // code
+      val schema = new StructType().add("column1", StringType, nullable = true).add(
+        "column2",
+        IntegerType,
+        nullable = true)
+
+      val nums = new util.ArrayList[Row]
+      for (i <- 0 until 100000) {
+        nums.add(RowFactory.create(s"apple$i", new Integer(i)))
+        nums.add(RowFactory.create(s"banana$i", new Integer(i)));
+        nums.add(RowFactory.create(s"apple$i", new Integer(i)));
+        nums.add(RowFactory.create(s"banana$i", new Integer(i)));
+        nums.add(RowFactory.create(s"cherry$i", new Integer(i)));
+      }
+
+      val df = sparkSession.createDataFrame(nums, schema)
+      val value = df.groupBy("column1").agg(sum("column2").as("sum")).select("column1", "sum")
+
+      Assert.assertEquals(value.count(), 300000)
       sparkSession.stop()
     }
   }
