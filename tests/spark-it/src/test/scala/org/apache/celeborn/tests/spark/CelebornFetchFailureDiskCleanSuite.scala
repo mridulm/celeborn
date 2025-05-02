@@ -20,8 +20,7 @@ import scala.collection.mutable
 
 import org.apache.spark.shuffle.celeborn.{SparkUtils, TestCelebornShuffleManager}
 
-import org.apache.celeborn.spark.FailedShuffleCleaner
-import org.apache.celeborn.tests.spark.fetch_failure.{FailCommitShuffleReaderGetHook, FetchFailureDiskCleanBase, FileDeletionShuffleReaderGetHook, TestRunningStageManager}
+import org.apache.celeborn.tests.spark.fetch_failure.{FailCommitShuffleReaderGetHook, FetchFailureDiskCleanBase, FileDeletionShuffleReaderGetHook}
 
 class CelebornFetchFailureDiskCleanSuite extends FetchFailureDiskCleanBase {
 
@@ -144,9 +143,6 @@ class CelebornFetchFailureDiskCleanSuite extends FetchFailureDiskCleanBase {
   test("celeborn spark integration test - Do not clean up the shuffle files being referred by more than one stages") {
     if (Spark3OrNewer) {
       // create dummy running stages
-      TestRunningStageManager.runningStages += 2
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.put(0, new mutable.HashSet[Int])
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.get(0) += 2
       val sparkSession = createSparkSession(
         enableFailedShuffleCleaner = true,
         enableCustomizedRunningStageMgr = true)
@@ -174,9 +170,6 @@ class CelebornFetchFailureDiskCleanSuite extends FetchFailureDiskCleanBase {
   test("celeborn spark integration test - clear the failed-to-commit shuffle file even it is referred by more than once") {
     if (Spark3OrNewer) {
       // create dummy running stages
-      TestRunningStageManager.runningStages += 2
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.put(0, new mutable.HashSet[Int])
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.get(0) += 2
       val sparkSession = createSparkSession(
         enableFailedShuffleCleaner = true,
         enableCustomizedRunningStageMgr = true)
@@ -201,8 +194,6 @@ class CelebornFetchFailureDiskCleanSuite extends FetchFailureDiskCleanBase {
     " the referring stage has finished") {
     if (Spark3OrNewer) {
       // create dummy running stages
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.put(0, new mutable.HashSet[Int])
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.get(0) += 2
       val sparkSession = createSparkSession(
         enableFailedShuffleCleaner = true,
         enableCustomizedRunningStageMgr = true)
@@ -229,11 +220,7 @@ class CelebornFetchFailureDiskCleanSuite extends FetchFailureDiskCleanBase {
   test("celeborn spark integration test - clean up the shuffle files if" +
     " the upstream stage is indeterministic") {
     if (Spark3OrNewer) {
-      TestRunningStageManager.runningStages += 2
-      TestRunningStageManager.indeterministicStages += 0
       // create dummy running stages
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.put(0, new mutable.HashSet[Int])
-      FailedShuffleCleaner.celebornShuffleIdToReferringStages.get(0) += 2
       val sparkSession = createSparkSession(
         enableFailedShuffleCleaner = true,
         enableCustomizedRunningStageMgr = true)

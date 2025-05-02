@@ -23,9 +23,8 @@ import java.security.SecureRandom
 import java.util
 import java.util.{function, List => JList}
 import java.util.concurrent._
-import java.util.concurrent.atomic.{AtomicInteger, LongAdder}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference, LongAdder}
 import java.util.function.{BiConsumer, Consumer}
-
 import scala.collection.JavaConverters._
 import scala.collection.generic.CanBuildFrom
 import scala.collection.mutable
@@ -33,10 +32,8 @@ import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.util.Random
-
 import com.google.common.annotations.VisibleForTesting
 import com.google.common.cache.{Cache, CacheBuilder}
-
 import org.apache.celeborn.client.LifecycleManager.{ShuffleAllocatedWorkers, ShuffleFailedWorkers}
 import org.apache.celeborn.client.listener.WorkerStatusListener
 import org.apache.celeborn.common.CelebornConf
@@ -76,6 +73,7 @@ object LifecycleManager {
 class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends RpcEndpoint
   with Logging {
 
+  private val stopped = new AtomicBoolean(false)
   private val lifecycleHost = Utils.localHostName(conf)
 
   private val shuffleExpiredCheckIntervalMs = conf.shuffleExpiredCheckIntervalMs
@@ -162,13 +160,21 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   // Threads
   private val forwardMessageThread =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("master-message-forwarder")
+  private val failedShuffleCleanerThreadPool = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+    "failedShuffleCleanerThreadPool")
   private var checkForShuffleRemoval: ScheduledFuture[_] = _
+  private var cleanerThreadFuture: ScheduledFuture[_] = _
   val rpcSharedThreadPool =
     ThreadUtils.newDaemonCachedThreadPool(
       "celeborn-client-lifecycle-manager-shared-rpc-pool",
       conf.clientRpcSharedThreads,
       30)
   val ec = ExecutionContext.fromExecutor(rpcSharedThreadPool)
+  // in celeborn ids
+  private val shufflesToBeCleaned = new LinkedBlockingQueue[Int]()
+  private val cleanedShuffleIds = new mutable.HashSet[Int]
+  @volatile
+  private var failedShuffleCleanerRef: Consumer[String] = null
 
   // init driver celeborn LifecycleManager rpc service
   override val rpcEnv: RpcEnv = RpcEnv.create(
@@ -267,8 +273,11 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   }
 
   override def onStop(): Unit = {
+    stopped.set(true)
     checkForShuffleRemoval.cancel(true)
+    cleanerThreadFuture.cancel(true)
     ThreadUtils.shutdown(forwardMessageThread)
+    ThreadUtils.shutdown(failedShuffleCleanerThreadPool)
 
     commitManager.stop()
     changePartitionManager.stop()
@@ -937,8 +946,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
                   }
                   val newShuffleId = shuffleIdGenerator.getAndIncrement()
                   logInfo(s"generate new shuffleId $newShuffleId for appShuffleId $appShuffleId appShuffleIdentifier $appShuffleIdentifier")
-                  validateCelebornShuffleIdForClean.foreach(callback =>
-                    callback.accept(appShuffleIdentifier))
+                  Option(failedShuffleCleanerRef).foreach(_.accept(appShuffleIdentifier))
                   shuffleIds.put(appShuffleIdentifier, (newShuffleId, true))
                   newShuffleId
                 }
@@ -953,8 +961,6 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         shuffleIds.values.filter(v => v._2).map(v => v._1).toSeq.reverse.find(
           areAllMapTasksEnd) match {
           case Some(celebornShuffleId) =>
-            recordShuffleIdReference.foreach(callback =>
-              callback.accept(celebornShuffleId, appShuffleIdentifier))
             val pbGetShuffleIdResponse = {
               logDebug(
                 s"get shuffleId $celebornShuffleId for appShuffleId $appShuffleId appShuffleIdentifier $appShuffleIdentifier isWriter $isWriter")
@@ -1159,7 +1165,6 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           shuffleIds.values.map {
             case (shuffleId, _) =>
               unregisterShuffle(shuffleId)
-              unregisterShuffleCallback.foreach(c => c.accept(shuffleId))
           })
       }
     } else {
@@ -1851,24 +1856,6 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     appShuffleTrackerCallback = Some(callback)
   }
 
-  // expecting celeborn shuffle id and application shuffle identifier
-  @volatile private var validateCelebornShuffleIdForClean: Option[Consumer[String]] =
-    None
-  def registerValidateCelebornShuffleIdForCleanCallback(
-      callback: Consumer[String]): Unit = {
-    validateCelebornShuffleIdForClean = Some(callback)
-  }
-  // expecting celeborn shuffle id and application shuffle identifier
-  @volatile private var recordShuffleIdReference: Option[BiConsumer[Integer, String]] = None
-  def registerRecordShuffleIdReferenceCallback(callback: BiConsumer[Integer, String]): Unit = {
-    recordShuffleIdReference = Some(callback)
-  }
-
-  @volatile private var unregisterShuffleCallback: Option[Consumer[Integer]] = None
-  def registerUnregisterShuffleCallback(callback: Consumer[Integer]): Unit = {
-    unregisterShuffleCallback = Some(callback)
-  }
-
   def registerAppShuffleDeterminate(appShuffleId: Int, determinate: Boolean): Unit = {
     appShuffleDeterminateMap.put(appShuffleId, determinate)
   }
@@ -1951,5 +1938,44 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     }
   }
 
-  def getShuffleIdMapping = shuffleIdMapping
+  def initializeFailedShuffleCleaner(failedShuffleCleaner: Consumer[String]): Unit = {
+    failedShuffleCleanerThreadPool.synchronized {
+      if (null != cleanerThreadFuture) {
+        return
+      }
+      failedShuffleCleanerRef = failedShuffleCleaner
+      val cleanInterval = conf.clientFetchCleanFailedShuffleIntervalMS
+      cleanerThreadFuture = failedShuffleCleanerThreadPool.scheduleWithFixedDelay(
+        new Runnable {
+          override def run(): Unit = {
+            Utils.tryLogNonFatalError {
+              try {
+                val allShuffleIds = new util.ArrayList[Int]
+                shufflesToBeCleaned.drainTo(allShuffleIds)
+                allShuffleIds.asScala.foreach { shuffleId =>
+                  if (!cleanedShuffleIds.contains(shuffleId)) {
+                    unregisterShuffle(shuffleId)
+                    logInfo(
+                      s"sent unregister shuffle request for shuffle $shuffleId (celeborn shuffle id)")
+                    cleanedShuffleIds += shuffleId
+                  }
+                }
+              } catch {
+                case e: Exception =>
+                  logError("unexpected exception in cleaner thread", e)
+              }
+            }
+          }
+        },
+        cleanInterval,
+        cleanInterval,
+        TimeUnit.MILLISECONDS)
+    }
+  }
+
+  def addShuffleIdsToBeCleaned(appShuffleId: Int): Unit = {
+    shuffleIdMapping.get(appShuffleId).foreach {
+      case (_, (celebornShuffleId, _)) => shufflesToBeCleaned.put(celebornShuffleId)
+    }
+  }
 }
